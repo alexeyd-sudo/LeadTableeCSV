@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRM Import Converter</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Конвертер таблиц для импорта в CRM</h1>
+    <p class="sub">Загрузите Excel/CSV, сопоставьте колонки с полями CRM и получите готовый файл для импорта.</p>
+  </header>
+
+  <div class="steps">
+    <div class="step-dot active" data-step="1">1. Файл</div>
+    <div class="step-dot" data-step="2">2. Проверка телефонов</div>
+    <div class="step-dot" data-step="3">3. Сопоставление полей</div>
+    <div class="step-dot" data-step="4">4. Результат</div>
+  </div>
+
+  <section id="step-upload" class="panel active">
+    <form id="upload-form">
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" name="file" accept=".xlsx,.xlsm,.csv,.txt" hidden>
+        <div class="dz-text">
+          <strong>Перетащите файл сюда</strong> или нажмите, чтобы выбрать
+          <div class="dz-hint">.xlsx, .xlsm или .csv</div>
+        </div>
+        <div class="dz-filename" id="dz-filename"></div>
+      </label>
+      <button type="submit" class="btn primary" id="upload-btn" disabled>Загрузить и проверить</button>
+    </form>
+    <div id="upload-error" class="error"></div>
+  </section>
+
+  <section id="step-scan" class="panel">
+    <div class="spinner-block" id="scan-spinner">
+      <div class="spinner"></div>
+      <p>Читаем файл и проверяем номера телефонов…</p>
+    </div>
+  </section>
+
+  <section id="step-map" class="panel">
+    <p class="hint">
+      Для каждой колонки исходного файла выберите, в какое поле CRM она должна попасть.
+      Колонки, где в одной ячейке найдено несколько телефонов, уже разбиты на отдельные
+      номера (Phone 1 / Phone 2 / Phone 3) — их можно раскидать по разным полям.
+      Поле <b>Source</b> будет автоматически заполнено значением <code>import</code> и в списке не показывается.
+    </p>
+    <div id="phone-summary" class="phone-summary"></div>
+    <div id="mapping-table" class="mapping-table"></div>
+    <button class="btn primary" id="convert-btn">Сформировать CSV</button>
+    <div id="convert-error" class="error"></div>
+  </section>
+
+  <section id="step-result" class="panel">
+    <div id="result-summary"></div>
+    <a id="download-link" class="btn primary" href="#" download>Скачать CSV</a>
+    <button class="btn" id="restart-btn">Загрузить другой файл</button>
+    <div id="result-preview"></div>
+  </section>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
