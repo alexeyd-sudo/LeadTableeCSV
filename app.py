@@ -1,4 +1,22 @@
+"""
+Flask front-end for the CRM import converter.
+
+All real work lives in converter.py; this module only handles uploads,
+session state and file downloads.
+
+Endpoints
+---------
+GET  /                          the single-page UI
+POST /api/upload                file -> session + column analysis + suggested mapping
+POST /api/convert               mapping + options -> 4 downloadable CSVs
+GET  /download/<sid>/<kind>     kind = raw | merged | duplicates | fixes
+GET  /download/<sid>            legacy alias for kind = raw
+GET  /healthz                   liveness probe
+"""
 import os
+import re
+import shutil
+import time
 import uuid
 import threading
 
@@ -12,23 +30,97 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 ALLOWED_EXT = {'.xlsx', '.xlsm', '.csv', '.txt'}
 MAX_CONTENT_LENGTH = 25 * 1024 * 1024  # 25 MB
+SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', 6 * 3600))
+MAX_SESSIONS = int(os.environ.get('MAX_SESSIONS', 50))
+
+# Порт по умолчанию. Русская и английская версии сервиса должны слушать
+# РАЗНЫЕ порты, иначе вторая при запуске упадёт с 'address already in use'.
+# Переопределяется переменной окружения PORT.
+PORT = int(os.environ.get('PORT', 5000))
+
+SESSION_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+# Files produced per session. kind -> (filename, download name)
+ARTIFACTS = {
+    'raw': ('result_raw.csv', 'crm_import_with_duplicates.csv'),
+    'merged': ('result_merged.csv', 'crm_import_merged.csv'),
+    'duplicates': ('report_duplicates.csv', 'duplicates_report.csv'),
+    'fixes': ('report_fixes.csv', 'field_fixes_report.csv'),
+}
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # In-memory session store: one process, fine for single-worker deployment.
-# {session_id: {...}}
+# {session_id: {'created': ts, 'headers': ..., 'rows': ..., ...}}
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# session housekeeping
+# ---------------------------------------------------------------------------
+
+def _drop_session(session_id):
+    SESSIONS.pop(session_id, None)
+    shutil.rmtree(os.path.join(UPLOAD_DIR, session_id), ignore_errors=True)
+
+
+def cleanup_sessions():
+    """Expire old sessions and cap total count. Without this both RAM and
+    uploads/ grow forever - the uploaded tables contain lead data, so they
+    should not linger on disk either."""
+    now = time.time()
+    with SESSIONS_LOCK:
+        stale = [sid for sid, s in SESSIONS.items()
+                 if now - s['created'] > SESSION_TTL_SECONDS]
+        for sid in stale:
+            _drop_session(sid)
+        if len(SESSIONS) > MAX_SESSIONS:
+            oldest = sorted(SESSIONS.items(), key=lambda kv: kv[1]['created'])
+            for sid, _ in oldest[:len(SESSIONS) - MAX_SESSIONS]:
+                _drop_session(sid)
+
+    # orphan directories left behind by a previous process
+    cutoff = now - SESSION_TTL_SECONDS
+    try:
+        for name in os.listdir(UPLOAD_DIR):
+            path = os.path.join(UPLOAD_DIR, name)
+            if not os.path.isdir(path) or not SESSION_ID_RE.match(name):
+                continue
+            with SESSIONS_LOCK:
+                if name in SESSIONS:
+                    continue
+            if os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _session_dir(session_id):
+    return os.path.join(UPLOAD_DIR, session_id)
+
+
+# ---------------------------------------------------------------------------
+# routes
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
     return render_template('index.html', target_fields=converter.TARGET_FIELDS)
 
 
+@app.route('/healthz')
+def healthz():
+    with SESSIONS_LOCK:
+        n = len(SESSIONS)
+    return jsonify({'status': 'ok', 'sessions': n})
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload():
+    cleanup_sessions()
+
     file = request.files.get('file')
     if not file or not file.filename:
         return jsonify({'error': 'Файл не выбран'}), 400
@@ -36,32 +128,44 @@ def upload():
     filename = file.filename
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
-        return jsonify({'error': f'Неподдерживаемый формат файла: {ext or "неизвестен"}. Поддерживаются .xlsx, .xlsm, .csv'}), 400
+        return jsonify({'error': f'Неподдерживаемый формат файла: {ext or "неизвестен"}. '
+                                 f'Поддерживаются .xlsx, .xlsm, .csv'}), 400
 
     session_id = uuid.uuid4().hex
-    session_dir = os.path.join(UPLOAD_DIR, session_id)
+    session_dir = _session_dir(session_id)
     os.makedirs(session_dir, exist_ok=True)
     src_path = os.path.join(session_dir, 'source' + ext)
     file.save(src_path)
 
     try:
         headers, rows, hyperlinks = converter.read_table(src_path, filename)
+    except converter.TableTooLargeError as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
+        shutil.rmtree(session_dir, ignore_errors=True)
         return jsonify({'error': f'Не удалось прочитать файл: {e}'}), 400
 
     if not headers or not rows:
-        return jsonify({'error': 'В файле не найдено данных (проверьте, что первая строка — заголовки колонок).'}), 400
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return jsonify({'error': 'В файле не найдено данных '
+                                 '(проверьте, что первая строка — заголовки колонок).'}), 400
 
-    phone_cols = converter.detect_phone_columns(headers, rows)
+    col_stats = converter.analyze_columns(headers, rows)
+    phone_cols = converter.detect_phone_columns(headers, rows, col_stats=col_stats)
     phone_data = converter.scan_phones(headers, rows, phone_cols)
-    source_columns = converter.build_source_columns(headers, rows, phone_data)
+    source_columns = converter.build_source_columns(headers, rows, phone_data, col_stats)
+    suggested = converter.suggest_mapping(source_columns)
 
     with SESSIONS_LOCK:
         SESSIONS[session_id] = {
+            'created': time.time(),
             'headers': headers,
             'rows': rows,
             'hyperlinks': hyperlinks,
             'phone_data': phone_data,
+            'col_stats': col_stats,
+            'labels': {c['key']: c['label'] for c in source_columns},
             'filename': filename,
         }
 
@@ -80,14 +184,49 @@ def upload():
         'source_columns': source_columns,
         'target_fields': converter.TARGET_FIELDS,
         'phone_summary': phone_summary,
+        'suggested_mapping': suggested,
+        'warnings': _upload_warnings(headers, rows, phone_data, col_stats),
+        'defaults': converter.DEFAULT_OPTIONS,
+        'encodings': converter.CSV_ENCODINGS,
     })
+
+
+def _upload_warnings(headers, rows, phone_data, col_stats):
+    """Things the operator should look at before pressing "convert"."""
+    out = []
+    for c, info in phone_data.items():
+        st = info['stats']
+        if st['overflow']:
+            out.append(f'В колонке «{headers[c]}» найдено больше '
+                       f'{converter.MAX_PHONES_PER_CELL} номеров в одной ячейке — '
+                       f'{st["overflow"]} шт. не поместились.')
+        if st['foreign_emails']:
+            out.append(f'В телефонной колонке «{headers[c]}» найдено '
+                       f'{st["foreign_emails"]} e-mail — они будут перенесены в поле E-mail.')
+        if st['foreign_urls']:
+            out.append(f'В телефонной колонке «{headers[c]}» найдено '
+                       f'{st["foreign_urls"]} ссылок — они будут перенесены в поле Website.')
+        if st['fixed']:
+            out.append(f'{st["fixed"]} номеров были без «+» и без кода страны — код угадан '
+                       f'по самому номеру. Если страна известна, укажите код страны '
+                       f'по умолчанию на шаге сопоставления.')
+    for st in col_stats:
+        if st['nonempty'] and st['dominant'] and st['share'] < 0.7:
+            out.append(f'Колонка «{st["header"]}» смешанная: '
+                       + ', '.join(f'{k}={v}' for k, v in st['counts'].items() if v)
+                       + '. Автоисправление разложит значения по типам.')
+    return out
 
 
 @app.route('/api/convert', methods=['POST'])
 def convert():
     data = request.get_json(force=True, silent=True) or {}
-    session_id = data.get('session_id')
+    session_id = data.get('session_id') or ''
     mapping = data.get('mapping') or {}
+    options = data.get('options') or {}
+
+    if not SESSION_ID_RE.match(session_id):
+        return jsonify({'error': 'Некорректный идентификатор сессии.'}), 400
 
     with SESSIONS_LOCK:
         session = SESSIONS.get(session_id)
@@ -97,37 +236,129 @@ def convert():
     if not any(mapping.values()):
         return jsonify({'error': 'Не выбрано ни одного поля для сопоставления.'}), 400
 
-    output_rows = converter.build_output_rows(
+    opts = converter.normalize_options(options)
+
+    # The default country code changes phone normalization, so the phone
+    # columns have to be re-scanned when it is set.
+    phone_data = session['phone_data']
+    if opts['default_country_code']:
+        phone_data = converter.scan_phones(
+            session['headers'], session['rows'], list(phone_data.keys()),
+            opts['default_country_code'])
+
+    records, fixes = converter.build_records(
         session['headers'], session['rows'], session['hyperlinks'],
-        session['phone_data'], mapping,
+        phone_data, mapping, opts, session['labels'],
     )
+    merged, groups = converter.dedupe_records(records, opts)
 
-    out_path = os.path.join(UPLOAD_DIR, session_id, 'result.csv')
-    converter.write_csv(out_path, output_rows)
+    session_dir = _session_dir(session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    sanitize = bool(opts['sanitize_formulas'])
+    translit = bool(opts['transliterate'])
+    enc = opts['csv_encoding']
 
-    filled = {h: 0 for h in converter.OUTPUT_HEADERS}
-    for row in output_rows:
-        for h, v in zip(converter.OUTPUT_HEADERS, row):
-            if v:
-                filled[h] += 1
+    raw_rows = converter.records_to_rows(records, sanitize, translit)
+    merged_rows = converter.records_to_rows(merged, sanitize, translit)
+
+    enc_raw = converter.write_csv(os.path.join(session_dir, ARTIFACTS['raw'][0]),
+                                  raw_rows, encoding=enc)
+    enc_merged = converter.write_csv(os.path.join(session_dir, ARTIFACTS['merged'][0]),
+                                     merged_rows, encoding=enc)
+    # Reports are for humans in Excel - always UTF-8 with BOM.
+    converter.write_csv(os.path.join(session_dir, ARTIFACTS['duplicates'][0]),
+                        converter.duplicates_report_rows(groups),
+                        converter.DUP_REPORT_HEADERS, encoding='utf-8-sig')
+    converter.write_csv(os.path.join(session_dir, ARTIFACTS['fixes'][0]),
+                        converter.fixes_report_rows(fixes),
+                        converter.FIX_REPORT_HEADERS, encoding='utf-8-sig')
+
+    with SESSIONS_LOCK:
+        if session_id in SESSIONS:
+            SESSIONS[session_id]['encoding'] = enc
+
+    moved = sum(1 for f in fixes if f['action'] == 'moved')
+    dropped = sum(1 for f in fixes if f['action'] == 'duplicate')
 
     return jsonify({
-        'download_url': f'/download/{session_id}',
-        'row_count': len(output_rows),
-        'preview': output_rows[:5],
         'headers': converter.OUTPUT_HEADERS,
-        'filled': filled,
+        'encoding': {
+            'id': enc,
+            'label': next((e['label'] for e in converter.CSV_ENCODINGS if e['id'] == enc), enc),
+            'transliterate': translit,
+            'replaced': enc_raw['replaced'] + enc_merged['replaced'],
+            'affected_rows': max(enc_raw['affected_rows'], enc_merged['affected_rows']),
+        },
+        'raw': {
+            'row_count': len(records),
+            'filled': _filled(records),
+            'preview': raw_rows[:5],
+            'download_url': f'/download/{session_id}/raw',
+        },
+        'merged': {
+            'row_count': len(merged),
+            'filled': _filled(merged),
+            'preview': merged_rows[:5],
+            'download_url': f'/download/{session_id}/merged',
+        },
+        'duplicates': {
+            'group_count': len(groups),
+            'collapsed_rows': len(records) - len(merged),
+            'download_url': f'/download/{session_id}/duplicates',
+            'groups': groups[:50],
+        },
+        'fixes': {
+            'moved': moved,
+            'dropped_duplicates': dropped,
+            'download_url': f'/download/{session_id}/fixes',
+            'items': fixes[:50],
+        },
+        # legacy field kept so older bookmarks/scripts keep working
+        'row_count': len(records),
+        'preview': raw_rows[:5],
+        'filled': _filled(records),
+        'download_url': f'/download/{session_id}/raw',
     })
 
 
+def _filled(records):
+    counts = {h: 0 for h in converter.OUTPUT_HEADERS}
+    for rec in records:
+        for h in converter.OUTPUT_HEADERS:
+            if rec.get(h):
+                counts[h] += 1
+    return counts
+
+
 @app.route('/download/<session_id>')
-def download(session_id):
-    session_id = session_id.replace('/', '').replace('\\', '')
-    path = os.path.join(UPLOAD_DIR, session_id, 'result.csv')
+@app.route('/download/<session_id>/<kind>')
+def download(session_id, kind='raw'):
+    if not SESSION_ID_RE.match(session_id or ''):
+        abort(404)
+    if kind not in ARTIFACTS:
+        abort(404)
+    fname, download_name = ARTIFACTS[kind]
+    path = os.path.join(_session_dir(session_id), fname)
     if not os.path.isfile(path):
         abort(404)
-    return send_file(path, as_attachment=True, download_name='crm_import.csv', mimetype='text/csv')
+    # Reports are always UTF-8+BOM; the two result files follow the operator's
+    # choice. Declaring the charset helps anything that fetches over HTTP.
+    if kind in ('raw', 'merged'):
+        with SESSIONS_LOCK:
+            session = SESSIONS.get(session_id)
+        charset = (session or {}).get('encoding') or converter.CSV_ENCODING
+    else:
+        charset = 'utf-8-sig'
+    charset = 'utf-8' if charset == 'utf-8-sig' else charset
+    return send_file(path, as_attachment=True, download_name=download_name,
+                     mimetype=f'text/csv; charset={charset}')
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    mb = MAX_CONTENT_LENGTH // (1024 * 1024)
+    return jsonify({'error': f'Файл больше {mb} МБ.'}), 413
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=PORT, debug=True)

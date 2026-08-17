@@ -1,92 +1,137 @@
-# CRM Import Converter — мини-сайт
+# CRM Import Converter
 
-Веб-интерфейс для конвертации Excel/CSV таблиц лидов в CSV, готовый для
-импорта в CRM (формат совместим с известным рабочим шаблоном `ErnestoTRUE.csv`).
+> **Language:** English (this file) · [Русский](README.ru.md)
+>
+> **This build has a Russian user interface.** An identical service with an
+> English interface lives in a separate repository:
+> [crm-import-converter](https://github.com/alexeyd-sudo/crm-import-converter).
+> The code is the same; only the UI strings, messages and report labels differ.
+> The documents under [`docs/`](docs/) are in Russian — the English versions are
+> in that other repository.
 
-## Как это работает
-
-1. **Загрузка файла** — .xlsx, .xlsm или .csv.
-2. **Проверка телефонов** (крутилка) — сайт сканирует все колонки, находит
-   те, что похожи на телефонные (по названию колонки или по содержимому),
-   и для каждой ячейки достаёт до 3 телефонов. Если в колонке `TEL` было
-   несколько номеров в одной ячейке (`WA`, доп. номера через `/`, скобки и
-   т.д.) — они становятся отдельными подполями `TEL — Phone 1`,
-   `TEL — Phone 2`, `TEL — Phone 3`, которые можно раскидать по разным
-   полям. Каждый номер приводится к формату с `+` в начале (если `+` не
-   было — добавляется автоматически; если цифр слишком мало для уверенного
-   определения — номер помечается как подозрительный, но не отбрасывается).
-3. **Сопоставление полей** — слева список колонок исходного файла (включая
-   разбитые телефоны), справа выпадающий список целевых полей CRM:
-   - **Company Name / Lead Name** — одно значение сразу в 2 колонки результата
-   - **Mobile Phone / Home Phone / Other Phone Number**
-   - **Corporate Website / Other Website**
-   - **Work E-mail / Home E-mail / Other E-mail**
-   - **Country OUTREACH / Outreach comment / Comment** — необязательные поля,
-     заполнять не обязательно
-   - Поле **Source** в интерфейсе не показывается — во все строки результата
-     автоматически проставляется `import`.
-4. **Результат** — итоговый CSV со статистикой заполненности полей и
-   ссылкой на скачивание.
-
-## Почему раньше файл "криво" импортировался
-
-Старый скрипт (`convert_to_csv.py` в корне проекта) писал CSV через запятую,
-с BOM и в кавычках вокруг каждого поля. Эталонный `ErnestoTRUE.csv` (файл,
-который точно нормально импортировался) устроен иначе: разделитель — **`;`**,
-без BOM, кавычки только там, где реально нужны, окончания строк `\r\n`.
-Большинство импортёров (в т.ч. похоже и то, через что грузили `ErnestoTRUE.csv`)
-в этом окружении ждут `;`, поэтому файл с запятыми "разъезжался" — вся строка
-попадала в одну колонку. Новый сайт всегда пишет результат в этом же
-диалекте (`;`, `\r\n`, без BOM), но **в кодировке UTF-8** — то есть, в отличие
-от `ErnestoTRUE.csv`, буквы `é`, `í`, `ñ` и т.п. не теряются и не заменяются
-на `?`.
-
-Если после этого CRM всё равно показывает нечитаемые символы — откройте
-`app.py` и в `converter.py` поменяйте `CSV_ENCODING = 'utf-8'` на
-`'utf-8-sig'` (добавит BOM) или `'cp1251'`, в зависимости от того, что
-ожидает конкретная система импорта.
-
-## Установка и запуск (Windows)
+A web service that turns an arbitrary lead spreadsheet (Excel/CSV) into a CSV
+ready for CRM import.
 
 ```
-cd NEW
-py -m venv venv
-venv\Scripts\activate
+py -m venv venv && venv\Scripts\activate
 pip install -r requirements.txt
-py app.py
+py app.py            ->  http://localhost:5000
 ```
 
-Откройте http://localhost:5000
-
-## Запуск в проде
-
-Флаг `debug=True` в `app.py` предназначен только для разработки. Для
-постоянной работы на сервере используйте `waitress` (входит в
-requirements.txt, работает и на Windows, и на Linux):
+The port comes from the `PORT` environment variable and defaults to **5000**
+here (the English build defaults to **5001**), so both can run side by side:
 
 ```
-pip install -r requirements.txt
-waitress-serve --host=0.0.0.0 --port=5000 app:app
+set PORT=5050 && py app.py
 ```
 
-На Linux вместо waitress можно использовать gunicorn:
+## Documentation
+
+All four documents are in Russian.
+
+| Document | Audience |
+|---|---|
+| **[docs/SUPPORT.md](docs/SUPPORT.md)** | support and end users: how to run it, what every option and report means, common problems |
+| **[docs/DEVELOPER.md](docs/DEVELOPER.md)** | developers: architecture, data flow, HTTP API, extension points, production setup |
+| **[docs/DATA-ANALYSIS.md](docs/DATA-ANALYSIS.md)** | the source-data analysis and the weak spots it exposed |
+| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | what changed |
+
+## How it works
+
+1. **Upload a file** — `.xlsx`, `.xlsm` or `.csv`, up to 25 MB.
+   The first row must contain the column headers.
+
+2. **Scanning.** The service classifies the content of every column
+   (e-mail / phone / website / text), finds the phone columns and pulls up to
+   5 numbers out of each cell, normalising them to `+…` form. A cell holding
+   several numbers is split into sub-columns which can be mapped to different
+   CRM fields.
+
+3. **Field mapping.** The target fields are pre-selected automatically (from
+   the header wording and from the actual content) — check them. Targets:
+
+   * **Company Name / Lead Name** — one value written to 2 result columns
+   * **Mobile / Home / Other Phone**
+   * **Corporate / Other Website**
+   * **Work / Home / Other E-mail**
+   * **Country OUTREACH / Outreach comment / Comment** — optional
+   * **Source** — not shown; every row gets `import`
+
+4. **Result** — two files and two reports.
+
+## Two key ideas
+
+### Duplicates: two files, not a decision made for you
+
+The service never decides on your behalf. It produces **both** the full file
+(one row per source row) **and** the clean one (duplicates merged, data from
+every copy collected into a single row), **plus** a CSV report saying which
+rows were merged into which and on what grounds — with the original
+spreadsheet row numbers.
+
+The merge signals are individually toggleable: company name (including the
+parenthesised handle — `Alpha (alpha_mx)` = `alpha_mx`), e-mail,
+phone (last 9 digits, so a number with and without a country code counts as
+one) and website.
+
+On the real database: **436 rows → 355**, 57 duplicate groups, and rows with
+no contact details at all drop from 35 to 14 — merging recovers data from the
+sparser copies.
+
+### Values in the wrong column are fixed automatically
+
+The type is decided **by the content, not by the column header**:
+
+| Signal | Type |
+|---|---|
+| contains `@` | e-mail |
+| digits, `+`, brackets, dashes only | phone |
+| `http(s)://` scheme, `www.` prefix, or a domain with a real TLD | website |
+
+An e-mail typed into the phone column ends up in an E-mail field, a link ends
+up in Website, a number from the website column ends up in Phone. If the value
+is already present there, it is dropped as a duplicate. Every decision is
+written to `field_fixes_report.csv` with the source row number, so the
+automation can be audited.
+
+## Output format
+
+`;` as the delimiter, CRLF, quotes only where needed. The `;` matches
+`reference_import.csv`, the file that imported correctly; a comma-separated file
+made the whole row land in a single column.
+
+The encoding is **chosen on step 3**, default **UTF-8 with BOM**. The BOM is
+the marker Excel and most importers use to detect the encoding. Without it the
+receiver reads the two UTF-8 bytes of `é` as two characters of its own ANSI
+codepage, and after a pass through ASCII you get `México → M??xico` — two
+question marks per letter, the signature of a double re-encoding.
+
+If the CRM mangles letters under every encoding, there is a transliteration
+option (`México → Mexico`): the result becomes pure ASCII, which no re-encoding
+can corrupt. See [docs/SUPPORT.md](docs/SUPPORT.md) (in Russian).
+
+## Tests
+
 ```
-gunicorn -w 1 -b 0.0.0.0:5000 app:app
+py tests\test_converter.py       # 40 tests, no dependencies
 ```
 
-**Важно:** используйте ровно **1 worker**. Данные сессии (загруженный файл,
-результат сканирования телефонов) хранятся в памяти процесса — при
-нескольких worker'ах разные запросы могут попасть в разные процессы и
-не найти сессию. Если нужно несколько worker'ов/масштабирование — надо
-перенести SESSIONS из `app.py` в общее хранилище (Redis, файлы на диске
-и т.п.).
+## Production
 
-## Ограничения
+```
+waitress-serve --host=0.0.0.0 --port=5000 --threads=4 app:app
+```
 
-- Максимальный размер загружаемого файла — 25 МБ (меняется в `app.py`,
-  `MAX_CONTENT_LENGTH`).
-- Загруженные файлы и результаты складываются в `NEW/uploads/<session_id>/`
-  и не удаляются автоматически — периодически чистите эту папку вручную
-  или добавьте cron/задачу по расписанию.
-- Из одной ячейки достаётся максимум 3 телефона (этого достаточно почти
-  всегда; поменять лимит — константа `MAX_PHONES_PER_CELL` в `converter.py`).
+Use exactly **1 worker** — session state lives in process memory.
+Details and environment variables in [docs/DEVELOPER.md](docs/DEVELOPER.md).
+
+## Limits
+
+* Max upload 25 MB (`MAX_CONTENT_LENGTH` in `app.py`), 200 000 rows and
+  300 columns (`MAX_ROWS`/`MAX_COLS` in `converter.py`).
+* Sessions live 6 hours, then they are deleted together with the uploaded file
+  (`SESSION_TTL_SECONDS`).
+* At most 5 phone numbers are taken from one cell (`MAX_PHONES_PER_CELL`);
+  anything above that is reported as a warning rather than dropped silently.
+* **There is no authentication** — this is an internal-network tool. Put it
+  behind a reverse proxy with auth before exposing it.
